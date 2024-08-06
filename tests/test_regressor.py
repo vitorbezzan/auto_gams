@@ -5,15 +5,14 @@ import numpy as np
 import pandas as pd
 import pytest
 from sklearn.datasets import make_regression
-from sklearn.dummy import DummyRegressor
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import train_test_split
 
 from bezzanlabs.auto_gams import RegressionGAM
 
 
 @pytest.fixture(scope="session")
 def regression_data():
-    X, y = make_regression(n_samples=1000, n_features=20, n_informative=20)
+    X, y = make_regression(n_samples=1000, n_features=20, n_informative=10, noise=0.35)
     X = pd.DataFrame(X, columns=[f"col_{i}" for i in range(20)])
 
     X_train, X_test, y_train, y_test = train_test_split(

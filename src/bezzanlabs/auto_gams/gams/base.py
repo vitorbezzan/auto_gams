@@ -6,12 +6,12 @@ from functools import partial
 
 import numpy as np
 import optuna
-import pandas as pd
 from optuna.trial import Trial
 from pydantic import NonNegativeInt, validate_call
 from sklearn.base import BaseEstimator
 from sklearn.utils.validation import _check_y, check_array
 from statsmodels.gam.api import BSplines, GLMGam
+from statsmodels.gam.generalized_additive_model import GLMGamResults
 from statsmodels.genmod.families.family import Family
 
 from .types import Actuals, Inputs
@@ -22,7 +22,8 @@ class GAMOptions(tp.TypedDict, total=False):
     Available options to use when fitting a GAM model.
 
     Args:
-        max_df: Maximum degree of freedom to use when fitting GAMs.
+        max_df: Maximum degree of freedom to use when fitting GAMs. Minimum is
+            automatically set for 4 since we use BSplines as basis functions.
         minmax_alpha: Tuple with minimum and maximum exponents for alpha penalization
             when fitting GAMs.
     """
@@ -35,8 +36,9 @@ class BaseGAM(BaseEstimator):
     """
     Implements base behavior for all GAM models.
     """
-
+    _feature_names: list[str]
     study_: optuna.Study
+    model_: GLMGamResults
 
     def __new__(cls, *args, **kwargs):
         if cls is BaseGAM:
@@ -64,8 +66,6 @@ class BaseGAM(BaseEstimator):
         self._n_trials = n_trials
         self._timeout = timeout
 
-        self._feature_names: list[str] = []
-
     @property
     def study(self) -> optuna.Study | None:
         """
@@ -83,15 +83,12 @@ class BaseGAM(BaseEstimator):
         Fits model based in configurations.
 
         Args:
-            X: input data to use in fitting trees.
+            X: input data to use in fitting model.
             y: actual targets for fitting.
             fit_params: dictionary containing specific parameters to pass in fit
                 process.
         """
-        if isinstance(X, pd.DataFrame):
-            self._feature_names = list(X.columns)
-
-        self.study_ = optuna.create_study(direction="minimize")
+        self.study_ = optuna.create_study(name="gam_model", direction="minimize")
         self.study_.optimize(
             func=partial(
                 _to_optimize,
@@ -105,7 +102,17 @@ class BaseGAM(BaseEstimator):
             timeout=self._timeout,
         )
 
-        import pdb; pdb.set_trace()
+        self.model_ = GLMGam(
+            family=self._family,
+            exog=self._treat_x(X),
+            endog=self._treat_y(y),
+            smoother=BSplines(
+                X,
+                df=[self.study_.best_params[f"d_{i}"] for i in range(X.shape[1])],
+                degree=[3 for _ in range(X.shape[1])],
+            ),
+            alpha=[self.study_.best_params[f"a_{i}"] for i in range(X.shape[1])],
+        ).fit()
 
         return self
 
@@ -114,13 +121,16 @@ class BaseGAM(BaseEstimator):
         """
         Checks and treats X inputs for model consumption.
         """
+        if not hasattr(self, "_feature_names"):
+            self._feature_names = list(X.columns)
+
         check_array(  # type: ignore
-            np.array(X[self._feature_names or X.columns]),
+            np.array(X[self._feature_names]),
             dtype="numeric",
             force_all_finite=True,
         )
 
-        return tp.cast(pd.DataFrame, X[self._feature_names or X.columns])
+        return X[self._feature_names]
 
     @staticmethod
     @validate_call(config={"arbitrary_types_allowed": True})
@@ -132,8 +142,8 @@ class BaseGAM(BaseEstimator):
 
 
 def _to_optimize(
-    family: Family,
     trial: Trial,
+    family: Family,
     X: Inputs,
     y: Actuals,
     max_df: int,
@@ -152,7 +162,7 @@ def _to_optimize(
         minmax_alpha: Tuple with exponents for the regularization factor to be used for
             each spline.
     """
-    df_ = [trial.suggest_int(f"d_{i}", 0, max_df) for i in range(X.shape[1])]
+    df_ = [trial.suggest_int(f"d_{i}", 4, max_df) for i in range(X.shape[1])]
     alpha_ = [
         10 ** trial.suggest_float(f"a_{i}", minmax_alpha[0], minmax_alpha[1])
         for i in range(X.shape[1])
@@ -163,7 +173,7 @@ def _to_optimize(
             family=family,
             exog=X,
             endog=y,
-            smoother=BSplines(X, df=df_, degree=3 * np.ones(shape=(X.shape[1],))),
+            smoother=BSplines(X, df=df_, degree=[3 for _ in range(X.shape[1])]),
             alpha=alpha_,
         )
         .fit()
